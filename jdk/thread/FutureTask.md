@@ -21,9 +21,79 @@ Future模式的核心思想是能够让主线程将原来需要同步等待的�
 
 
 
+## 2、FutureTask介绍
+
+> 一个可取消的异步计算。FutureTask提供了对Future的基本实现，可以调用方法去开始、取消一个计算任务，可以查询计算是否完成、获取计算结果。只有当计算完成时才能获取到就算结果，否则获取结果的线程将会阻塞等待，一旦计算完成，计算将不能被重启或者取消，除非低啊用runAndReset方法。
+>
+> 
+>
+> 除了实现Future接口以外，FutureTask还实现了Runnable接口，因此FutureTask交由线程池Executor执行，也可以调用线程执行 --> new Thread(futureTask).run()
 
 
-## 2、Future使用方法
+
+- FutureTask共有7种状态
+
+```java
+    // 新建状态
+		private static final int NEW          = 0;  
+		// 即将结束，但是还未完全结束，返回值还未写入，处于一种临界状态
+    private static final int COMPLETING   = 1;  
+		// 正常结束状态（没有发生异常、中断、取消）
+    private static final int NORMAL       = 2;  
+		// 出现异常而中断，处于非正常结束状态
+    private static final int EXCEPTIONAL  = 3;  
+		// 因调用 cancel 而处于被取消状态
+    private static final int CANCELLED    = 4;  
+		// 中断中，但是还没完全中断的阶段
+    private static final int INTERRUPTING = 5;  
+		// 已完全中断
+    private static final int INTERRUPTED  = 6;  
+```
+
+
+
+
+
+
+
+
+
+- FutureTask其他参数
+
+```java
+    
+		/**
+		 * 我们在使用FutureTask对象时，会传入一个Callable实现类或者Runnable实现类，这个Callable存储的
+		 * 就是传入的Callable或者Runnable实现类（Runnable会被使用修饰者设计模式伪装成Callable），
+		 */
+		private Callable<V> callable;
+    
+		// 正常情况下，outcome保存的是任务的返回结果
+		// 非正常情况下，outcome保存的是任务抛出的异常
+    private Object outcome; 
+    
+		// 保存当前任务执行期间，执行任务的线程引用
+    private volatile Thread runner;
+    
+		// 当多线程取get结果时，会把线程封装为WaitNode（头插头取）
+    private volatile WaitNode waiters;
+
+	  static final class WaitNode {
+        // 执行任务线程
+        volatile Thread thread;
+        // 下一个WaitNote节点
+        volatile WaitNode next;
+        WaitNode() { thread = Thread.currentThread(); }
+    }
+```
+
+
+
+
+
+
+
+## 3、Future使用方法
 
 ```java
 public class FutureTaskTest {
@@ -142,7 +212,7 @@ class ComputeTask implements Callable<Integer> {
 
 
 
-## 3、FutureTask源码解析
+## 4、FutureTask源码解析
 
 
 
@@ -152,7 +222,7 @@ class ComputeTask implements Callable<Integer> {
 
 
 
-## 4、知识点补充
+## 5、知识点补充
 
 
 
