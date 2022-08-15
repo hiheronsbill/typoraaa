@@ -216,7 +216,259 @@ class ComputeTask implements Callable<Integer> {
 
 
 
+### 4.1、Future核心方法
 
+```java
+public interface Future<V> {
+
+    boolean cancel(boolean mayInterruptIfRunning);
+
+    boolean isCancelled();
+
+    boolean isDone();
+
+    V get() throws InterruptedException, ExecutionException;
+
+    V get(long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException;
+}
+```
+
+
+
+#### get()：获取结果
+
+get方法最主要的作用就是获取任务执行的结果，该方法在执行时的行为取决于Callable任务的状态，可能会发生以下5种情况：
+
+- 任务已经执行完毕。可以立即返回，获取到任务的执行结果。
+- 任务还没有结果。会把当前线程阻塞，直到任务完成再把结果返回。
+  - 任务还没开始
+  - 任务正在执行中（任务状态可能为NEW或者COMPLETING），COMPLETING时当前线程不阻塞，进入自循环
+- 任务执行过程抛出异常。一旦这样，当调用get的时候，就会抛出ExecutionException异常，不管我们执行call方法时里面抛出的异常类型是什么，在执行get方法时所获得的异常都是==ExecutionException==。
+- 任务被取消了。如果任务被取消，在执行get方法时则抛出==CancellationException==。
+- 任务超时。get方法有一个带延迟参数的重载方法，如果到达了指定时间依然没有完成任务，在执行get方法时则会抛出==TimeoutException==。
+
+```java
+    public V get() throws InterruptedException, ExecutionException {
+        int s = state;
+        // 任务状态为NEW、COMPLETING时，进入队列等待任务执行完成，否则调用report直接返回结果
+        if (s <= COMPLETING)
+            s = awaitDone(false, 0L);
+        return report(s);
+    }
+
+
+    public V get(long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException {
+        if (unit == null)
+            throw new NullPointerException();
+        int s = state;
+      
+        // 任务状态为NEW、COMPLETING时，进入队列等待任务执行完成，否则调用report直接返回结果
+				// 如果等待超时，则抛出超时异常
+        if (s <= COMPLETING &&
+            (s = awaitDone(true, unit.toNanos(timeout))) <= COMPLETING)
+            throw new TimeoutException();
+        return report(s);
+    }
+
+    /**
+     * 返回任务执行结果
+     * 1、正常结束则返回结果
+     * 2、被取消或中断则抛出取消异常
+     * 3、包装任务执行异常，统一返回ExecutionException
+     */
+    private V report(int s) throws ExecutionException {
+        Object x = outcome;
+        if (s == NORMAL)
+            return (V)x;
+        if (s >= CANCELLED)
+            throw new CancellationException();
+        throw new ExecutionException((Throwable)x);
+    }
+
+    /**
+     * 进入队列等待任务执行，run方法执行完成后会唤醒阻塞的线程
+     */
+    private int awaitDone(boolean timed, long nanos)
+        throws InterruptedException {
+        // 超时时间
+        final long deadline = timed ? System.nanoTime() + nanos : 0L;
+        WaitNode q = null;
+        // 是否入队
+        boolean queued = false;
+        for (;;) {  
+          	// 如果该线程被标记中断，则移除等待队列，并抛出中断异常
+            if (Thread.interrupted()) {
+                removeWaiter(q);
+                throw new InterruptedException();
+            }
+				
+            int s = state;
+            // 如果任务已执行完成，则返回
+            if (s > COMPLETING) {
+                if (q != null)
+                    // 置空当前线程引用，可当做一个标记，表名该等待节点已失效
+                    q.thread = null;
+                return s;
+            }
+            // COMPLETING表示任务即将完成，此时不必入队阻塞，让出线程自旋即可
+            else if (s == COMPLETING) // cannot time out yet
+                Thread.yield();
+            //  创建等待节点，自旋执行后续逻辑（可能入队、阻塞、结束）
+            else if (q == null)
+                q = new WaitNode();
+            // 将等待节点入队，采用头插法，将当前节点设置为等待头
+            else if (!queued)
+                queued = UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                                     q.next = waiters, q);
+            // 等待节点已入队，进行超时阻塞
+            else if (timed) {
+                nanos = deadline - System.nanoTime();
+                // 如果已超时，则移除当前节点，并返回任务执行状态
+                if (nanos <= 0L) {
+                    removeWaiter(q);
+                    return state;
+                }
+                // 否则原地阻塞
+                LockSupport.parkNanos(this, nanos);
+            }
+            // 等待节点已入队，同时无需超时处理，则原地阻塞
+            else
+                LockSupport.park(this);
+        }
+    }
+
+		/**
+     * 从等待队列中移除节点
+     */
+    private void removeWaiter(WaitNode node) {
+        if (node != null) {
+            node.thread = null;
+            // 循环标识，并发移除时需重新执行循环
+            retry:
+            for (;;) {          
+                // 从头节点开始迭代处理
+                for (WaitNode pred = null, q = waiters, s; q != null; q = s) {
+                  	// 保留后继节点引用  
+                  	s = q.next;
+                    // 当前节点所引用线程不为空，表示该等待节点有效，将其保留为前继节点
+                    // 否则表示该等待节点无效，可能已被取消、中断、超时等等
+                    if (q.thread != null)
+                        pred = q;
+                    // 当前节点的前驱节点不为空，此时可以尝试移除当前节点
+                    else if (pred != null) {
+                        // 将前驱节点的后继引用指向当前节点的后继节点
+                        pred.next = s;
+                        // 如果前驱节点的线程引用为空，表示可能存在并发移除
+                        // 为保证并发修改安全，跳出当前循环，重新从头结点迭代处理
+                        if (pred.thread == null) // check for race
+                            continue retry;
+                    }
+                    // 当前节点为无效节点，并且当前节点的前驱节点为空
+                    // 尝试使用后继节点替代前驱节点，作为新的头节点
+                    // 如果替换失败，跳出当前循环，重新从头结点迭代处理
+                    else if (!UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                                          q, s))
+                        continue retry;
+                }
+                break;
+            }
+        }
+    }
+```
+
+
+
+
+
+#### isDone()：判断是否执行完毕
+
+如果返回了 true 则代表执行完成了；如果返回 false 则代表还没有完成。
+
+**需要注意的是**，这里如果返回 true ，并不代表这个任务时成功执行的，比如说一个任务执行一版抛出了异常，该方法其实也是会返回 true 的。
+
+
+
+#### cancel()：取消任务的执行
+
+如果不想执行某个任务了，可以使用cancel方法，可能会有以下三种情况：
+
+- 如果任务还没开始时，一旦调用了cancel，这个任务就会被正常取消，未来也不会执行，返回true。
+- 如果任务已经完成，或者之前已经被取消过了，那么执行cancel则代表取消失败，返回false。
+- 如果任务正在执行中，此时cancel不会直接取消这个任务，而是会根据传参做判断。cancel方法会传一个布尔类型参数mayInterruptRunning
+  - 为true，执行任务的线程会收到一个中断信号，正在执行的任务可能会有一些处理中断的逻辑进而停止。
+  - 为false，则不中断正在运行的任务，也就是说，本次cancel不会有任务效果。
+
+那么如果选择传入 true 还是 false？
+
+- 如果明确知道该线程不能处理中断，则传false
+- 如果该任务一旦运行，我们希望它完全执行，则传false
+
+
+
+```java
+ 		/**
+     * 从等待队列中移除节点，参数为知否支持执行中断
+     */   
+		public boolean cancel(boolean mayInterruptIfRunning) {
+      	// 如果任务不为NEW，或者修改任务状态失败，则无法取消，返回false
+        if (!(state == NEW &&
+              UNSAFE.compareAndSwapInt(this, stateOffset, NEW,
+                  mayInterruptIfRunning ? INTERRUPTING : CANCELLED)))
+            return false;
+        try {    
+            // 如果可中断运行中的任务，则为任务线程设置中断标识
+            if (mayInterruptIfRunning) {
+                try {
+                    Thread t = runner;
+                    if (t != null)
+                        t.interrupt();
+                } finally { 
+                    // 设置任务状态为 已中断
+                    UNSAFE.putOrderedInt(this, stateOffset, INTERRUPTED);
+                }
+            }
+        } finally {
+            // 移除所有等待节点，并唤醒阻塞线程
+            finishCompletion();
+        }
+        return true;
+    }
+
+   /**
+     * 移除所有等待节点，并唤醒阻塞线程
+     */ 
+    private void finishCompletion() {
+        for (WaitNode q; (q = waiters) != null;) {
+            // 置空等待头节点
+            if (UNSAFE.compareAndSwapObject(this, waitersOffset, q, null)) {
+                for (;;) {
+                    Thread t = q.thread;
+                    // 置空等待节点线程引用，同时唤醒阻塞线程
+                    if (t != null) {
+                        q.thread = null;
+                        LockSupport.unpark(t);
+                    }
+                    // 迭代移除等待节点
+                    WaitNode next = q.next;
+                    if (next == null)
+                        break;
+                    q.next = null; // unlink to help gc
+                    q = next;
+                }
+                break;
+            }
+     }
+```
+
+
+
+
+
+#### isCancelled()：判断是否被取消
+
+与cancel方法配合使用
 
 
 
